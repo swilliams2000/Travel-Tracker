@@ -1,17 +1,18 @@
 import express from "express";
+import "dotenv/config";
 import bodyParser from "body-parser";
 import pg from "pg";
 
+const { Client } = pg;
+
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 const db = new pg.Client({
-  user: "postgres",
-  host: "localhost",
-  database: "world",
-  password: "Cooliemon4!",
-  port: 5432,
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Neon requires SSL
 });
+
 db.connect();
 
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -42,7 +43,7 @@ function color(id) {
 async function checkVisisted() {
   const result = await db.query(
     "SELECT country_code FROM visited_countries WHERE user_id = ($1)",
-    [currentUserId]
+    [currentUserId],
   );
   let countries = [];
   result.rows.forEach((country) => {
@@ -67,7 +68,7 @@ app.post("/add", async (req, res) => {
   try {
     const result = await db.query(
       "SELECT country_code FROM countries WHERE LOWER(country_name) LIKE '%' || $1 || '%';",
-      [input.toLowerCase()]
+      [input.toLowerCase()],
     );
 
     const data = result.rows[0];
@@ -75,7 +76,7 @@ app.post("/add", async (req, res) => {
     try {
       await db.query(
         "INSERT INTO visited_countries (country_code, user_id) VALUES ($1, $2)",
-        [countryCode, currentUserId]
+        [countryCode, currentUserId],
       );
       res.redirect("/");
     } catch (err) {
@@ -114,5 +115,5 @@ app.post("/new", async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Server running on http://localhost:${port}`);
+  console.log("app is running on neon and render");
 });
