@@ -1,5 +1,7 @@
 import express from "express";
 import "dotenv/config";
+console.log("ENV DATABASE_URL defined?", Boolean(process.env.DATABASE_URL));
+
 import bodyParser from "body-parser";
 import pg from "pg";
 
@@ -14,6 +16,30 @@ const db = new pg.Client({
 });
 
 db.connect();
+
+console.log("PG HOST:", db.connectionParameters.host);
+console.log("PG DB:", db.connectionParameters.database);
+
+(async () => {
+  try {
+    const info = await db.query(`
+      SELECT
+        current_database() AS db,
+        current_user AS "user",
+        inet_server_addr() AS server_ip,
+        inet_server_port() AS server_port,
+        (SELECT setting FROM pg_settings WHERE name='listen_addresses') AS listen_addresses,
+        version() AS version;
+    `);
+    console.log("CONNECTED TO:", info.rows[0]);
+    console.log(
+      "DATABASE_URL (redact pwd):",
+      process.env.DATABASE_URL?.replace(/:\/\/([^:]+):([^@]+)@/, "://$1:***@"),
+    );
+  } catch (e) {
+    console.error("DB CONNECT CHECK FAILED:", e);
+  }
+})();
 
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static("public"));
@@ -75,30 +101,32 @@ app.get("/", async (req, res) => {
 });
 
 app.post("/add", async (req, res) => {
+  console.log("HIT /add", new Date().toISOString());
+  console.log("BODY:", req.body);
   const input = (req.body.country || "").trim();
-
-  if (!input) {
-    return res.redirect("/");
-  }
+  if (!input) return res.redirect("/");
 
   try {
-    // Look up country code by name
-    const result = await db.query(
-      "SELECT country_code FROM countries WHERE LOWER(country_name) LIKE '%' || $1 || '%';",
+    // 1) Find the country code (AU, US, etc.)
+    const lookup = await db.query(
+      "SELECT country_code FROM countries WHERE LOWER(country_name) LIKE '%' || $1 || '%' LIMIT 1;",
       [input.toLowerCase()],
     );
 
-    if (result.rows.length === 0) {
-      return res.redirect("/"); // country not found
+    if (lookup.rows.length === 0) {
+      console.log("NOT FOUND:", input);
+      return res.redirect("/");
     }
 
-    const countryCode = result.rows[0].country_code;
+    const countryCode = lookup.rows[0].country_code;
 
-    // Insert visit
-    await db.query(
-      "INSERT INTO visited_countries (country_code, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING;",
+    // 2) Insert visit and return the inserted row
+    const inserted = await db.query(
+      "INSERT INTO visited_countries (country_code, user_id) VALUES ($1, $2) RETURNING *;",
       [countryCode, currentUserId],
     );
+
+    console.log("INSERTED:", inserted.rows[0]); // ✅ now inserted is defined
 
     return res.redirect("/");
   } catch (err) {
