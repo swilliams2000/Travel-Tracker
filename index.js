@@ -53,15 +53,27 @@ async function checkVisisted() {
 }
 app.get("/", async (req, res) => {
   await checkUser();
-  const countries = await checkVisisted();
-  let userColor = color(currentUserId);
+
+  const visited = await checkVisisted(); // whatever it returns now
+  const countries = Array.isArray(visited)
+    ? visited
+        .map((v) => (typeof v === "string" ? v : v.country_code))
+        .filter(Boolean)
+    : String(visited || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+  const userColor = color(currentUserId);
+
   res.render("index.ejs", {
-    countries: countries,
+    countries,
     total: countries.length,
-    users: users,
+    users,
     color: userColor,
   });
 });
+
 app.post("/add", async (req, res) => {
   const input = (req.body.country || "").trim();
 

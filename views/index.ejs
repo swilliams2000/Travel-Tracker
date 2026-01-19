@@ -388,16 +388,14 @@
   <h2 class="total-count">Total Countries: <%=total%>
   </h2>
 <script>
-  const country_codes = "<%= countries %>".split(",");
-
+  const country_codes = <%- JSON.stringify(countries) %>; // countries should be ['FR','GB']
   country_codes.forEach(code => {
-    const id = code.trim();
-    if (!id) return;
-    const el = document.getElementById(id);
+    const el = document.getElementById(code);
     if (!el) return;
     el.style.fill = "<%= color %>";
   });
 </script>
+
 </body>
 
 </html>
