@@ -1,132 +1,144 @@
+// index.js
 import express from "express";
 import "dotenv/config";
-console.log("ENV DATABASE_URL defined?", Boolean(process.env.DATABASE_URL));
-
 import bodyParser from "body-parser";
 import pg from "pg";
 
-const { Client } = pg;
-
 const app = express();
 const port = process.env.PORT || 3000;
+
+// ---------- DB ----------
+if (!process.env.DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL is not set. Add it to your .env file.");
+  process.exit(1);
+}
 
 const db = new pg.Client({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }, // Neon requires SSL
 });
 
-db.connect();
+const DEBUG = true;
 
-console.log("PG HOST:", db.connectionParameters.host);
-console.log("PG DB:", db.connectionParameters.database);
-
-(async () => {
-  try {
-    const info = await db.query(`
-      SELECT
-        current_database() AS db,
-        current_user AS "user",
-        inet_server_addr() AS server_ip,
-        inet_server_port() AS server_port,
-        (SELECT setting FROM pg_settings WHERE name='listen_addresses') AS listen_addresses,
-        version() AS version;
-    `);
-    console.log("CONNECTED TO:", info.rows[0]);
-    console.log(
-      "DATABASE_URL (redact pwd):",
-      process.env.DATABASE_URL?.replace(/:\/\/([^:]+):([^@]+)@/, "://$1:***@"),
-    );
-  } catch (e) {
-    console.error("DB CONNECT CHECK FAILED:", e);
-  }
-})();
-
+// ---------- Middleware ----------
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static("public"));
 
-let currentUserId = 1;
+app.set("view engine", "ejs");
 
+// ---------- App State ----------
+let currentUserId = 1;
 let users = [];
 
-async function checkUser() {
-  try {
-    const result = await db.query("SELECT id, name, color FROM users");
-    users = result.rows; // each row already has id, name, color
-    console.log(users);
-  } catch (err) {
-    console.error("Error fetching users:", err);
-  }
-}
-
-function color(id) {
-  for (let i = 0; i < users.length; i++) {
-    if (users[i].id === id) {
-      return users[i].color;
-    }
-  }
-}
-
-async function checkVisisted() {
+// ---------- Helpers ----------
+async function loadUsers() {
   const result = await db.query(
-    "SELECT country_code FROM visited_countries WHERE user_id = ($1)",
-    [currentUserId],
+    "SELECT id, name, color FROM users ORDER BY id;",
   );
-  let countries = [];
-  result.rows.forEach((country) => {
-    countries.push(country.country_code);
-  });
-  return countries;
+  users = result.rows;
+  return users;
 }
+
+function getUserColor(userId) {
+  const u = users.find((x) => Number(x.id) === Number(userId));
+  return u?.color || "teal";
+}
+
+async function getVisitedCountryCodes(userId) {
+  const result = await db.query(
+    "SELECT country_code FROM visited_countries WHERE user_id = $1 ORDER BY id;",
+    [userId],
+  );
+  return result.rows.map((r) => r.country_code);
+}
+
+// ---------- Debug Routes ----------
+app.get("/ping", (req, res) => res.send("pong"));
+
+app.get("/debug/neon", async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT
+        current_database() AS db,
+        current_user AS "user",
+        (SELECT setting FROM pg_settings WHERE name='server_version') AS server_version,
+        (SELECT COUNT(*) FROM visited_countries) AS visit_count,
+        EXISTS (
+          SELECT 1 FROM visited_countries WHERE country_code = 'AU' AND user_id = 1
+        ) AS au_exists_for_user1
+    `);
+    res.json({
+      host: db.connectionParameters.host,
+      ...r.rows[0],
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---------- Routes ----------
 app.get("/", async (req, res) => {
-  await checkUser();
+  try {
+    await loadUsers();
+    const countries = await getVisitedCountryCodes(currentUserId);
+    const userColor = getUserColor(currentUserId);
 
-  const visited = await checkVisisted(); // whatever it returns now
-  const countries = Array.isArray(visited)
-    ? visited
-        .map((v) => (typeof v === "string" ? v : v.country_code))
-        .filter(Boolean)
-    : String(visited || "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-  const userColor = color(currentUserId);
-
-  res.render("index.ejs", {
-    countries,
-    total: countries.length,
-    users,
-    color: userColor,
-  });
+    res.render("index.ejs", {
+      countries, // MUST be an array of ISO-2 codes like ["FR","GB"]
+      total: countries.length,
+      users,
+      color: userColor,
+    });
+  } catch (err) {
+    console.error("GET / error:", err);
+    res.status(500).send("Server error");
+  }
 });
 
 app.post("/add", async (req, res) => {
-  console.log("HIT /add", new Date().toISOString());
-  console.log("BODY:", req.body);
   const input = (req.body.country || "").trim();
   if (!input) return res.redirect("/");
 
   try {
-    // 1) Find the country code (AU, US, etc.)
+    if (DEBUG) {
+      console.log("HIT /add", new Date().toISOString(), "input:", input);
+      console.log("RUNTIME HOST:", db.connectionParameters.host);
+    }
+
+    // Find country code from country name (e.g., "Australia" -> "AU")
     const lookup = await db.query(
-      "SELECT country_code FROM countries WHERE LOWER(country_name) LIKE '%' || $1 || '%' LIMIT 1;",
+      `
+      SELECT country_code
+      FROM countries
+      WHERE LOWER(country_name) LIKE '%' || $1 || '%'
+      ORDER BY country_name
+      LIMIT 1;
+      `,
       [input.toLowerCase()],
     );
 
-    if (lookup.rows.length === 0) {
-      console.log("NOT FOUND:", input);
+    if (lookup.rowCount === 0) {
+      if (DEBUG) console.log("NOT FOUND:", input);
       return res.redirect("/");
     }
 
     const countryCode = lookup.rows[0].country_code;
 
-    // 2) Insert visit and return the inserted row
+    // Insert; skip duplicates per (country_code, user_id)
     const inserted = await db.query(
-      "INSERT INTO visited_countries (country_code, user_id) VALUES ($1, $2) RETURNING *;",
+      `
+      INSERT INTO visited_countries (country_code, user_id)
+      VALUES ($1, $2)
+      ON CONFLICT (country_code, user_id) DO NOTHING
+      RETURNING *;
+      `,
       [countryCode, currentUserId],
     );
 
-    console.log("INSERTED:", inserted.rows[0]); // ✅ now inserted is defined
+    if (DEBUG) {
+      if (inserted.rowCount === 1) console.log("INSERTED:", inserted.rows[0]);
+      else console.log("ALREADY EXISTS:", { countryCode, currentUserId });
+    }
 
     return res.redirect("/");
   } catch (err) {
@@ -134,34 +146,63 @@ app.post("/add", async (req, res) => {
     return res.redirect("/");
   }
 });
+
 app.post("/user", async (req, res) => {
-  if (req.body.add === "new") {
-    res.render("new.ejs");
-  } else {
+  try {
+    if (req.body.add === "new") return res.render("new.ejs");
+
     currentUserId = Number(req.body.user);
-    console.log(currentUserId);
-    res.redirect("/");
+    return res.redirect("/");
+  } catch (err) {
+    console.error("POST /user error:", err);
+    return res.redirect("/");
   }
 });
 
 app.post("/new", async (req, res) => {
-  //Hint: The RETURNING keyword can return the data that was inserted.
-  //https://www.postgresql.org/docs/current/dml-returning.html
-  if (req.body.name === "") {
-    return res.render("new.ejs", { error: "emptyName" });
-  } else {
-    try {
-      await db.query("INSERT INTO users (name, color) VALUES ($1, $2)", [
-        req.body.name,
-        req.body.color,
-      ]);
-      res.redirect("/");
-    } catch (err) {
-      console.log(err);
-    }
+  const name = (req.body.name || "").trim();
+  const chosenColor = (req.body.color || "").trim();
+
+  if (!name) return res.render("new.ejs", { error: "emptyName" });
+
+  try {
+    await db.query("INSERT INTO users (name, color) VALUES ($1, $2);", [
+      name,
+      chosenColor,
+    ]);
+    return res.redirect("/");
+  } catch (err) {
+    console.error("POST /new error:", err);
+    return res.redirect("/");
   }
 });
 
-app.listen(port, () => {
-  console.log("app is running on neon and render");
+// ---------- Startup ----------
+async function start() {
+  await db.connect();
+
+  if (DEBUG) {
+    console.log("ENV DATABASE_URL defined?", Boolean(process.env.DATABASE_URL));
+    console.log("PG HOST:", db.connectionParameters.host);
+    console.log("PG DB:", db.connectionParameters.database);
+    console.log(
+      "DATABASE_URL (redact pwd):",
+      process.env.DATABASE_URL.replace(/:\/\/([^:]+):([^@]+)@/, "://$1:***@"),
+    );
+
+    // optional: quick identity check
+    const info = await db.query(
+      'SELECT current_database() AS db, current_user AS "user";',
+    );
+    console.log("CONNECTED TO:", info.rows[0]);
+  }
+
+  app.listen(port, () => {
+    console.log(`Server running on http://localhost:${port}`);
+  });
+}
+
+start().catch((err) => {
+  console.error("Startup failed:", err);
+  process.exit(1);
 });
