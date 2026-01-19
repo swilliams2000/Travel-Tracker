@@ -63,27 +63,35 @@ app.get("/", async (req, res) => {
   });
 });
 app.post("/add", async (req, res) => {
-  const input = req.body["country"];
+  const input = (req.body.country || "").trim();
+
+  if (!input) {
+    return res.redirect("/");
+  }
 
   try {
+    // Look up country code by name
     const result = await db.query(
       "SELECT country_code FROM countries WHERE LOWER(country_name) LIKE '%' || $1 || '%';",
       [input.toLowerCase()],
     );
 
-    const data = result.rows[0];
-    const countryCode = data.country_code;
-    try {
-      await db.query(
-        "INSERT INTO visited_countries (country_code, user_id) VALUES ($1, $2)",
-        [countryCode, currentUserId],
-      );
-      res.redirect("/");
-    } catch (err) {
-      console.log(err);
+    if (result.rows.length === 0) {
+      return res.redirect("/"); // country not found
     }
+
+    const countryCode = result.rows[0].country_code;
+
+    // Insert visit
+    await db.query(
+      "INSERT INTO visited_countries (country_code, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING;",
+      [countryCode, currentUserId],
+    );
+
+    return res.redirect("/");
   } catch (err) {
-    console.log(err);
+    console.error("Add country error:", err);
+    return res.redirect("/");
   }
 });
 app.post("/user", async (req, res) => {
